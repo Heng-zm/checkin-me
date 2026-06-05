@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: checkinme-postgres
+    environment:
+      POSTGRES_DB: checkinme
+      POSTGRES_USER: checkinme
+      POSTGRES_PASSWORD: checkinme
+    ports:
+      - "5432:5432"
+    volumes:
+      - checkinme_pg:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U checkinme -d checkinme"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build: .
+    container_name: checkinme-api
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    profiles:
+      - api
+
+volumes:
+  checkinme_pg:
