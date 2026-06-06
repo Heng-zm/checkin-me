@@ -84,3 +84,12 @@
 - Added migration advisory lock to prevent concurrent Render instances from applying migrations at the same time.
 - Added `device_events.external_event_id` and unique idempotency index.
 - Hardened Dockerfile for Render builds, smaller binary output, and non-root runtime user.
+
+## v5.6 - QR token 500 fix
+
+- Fixed `POST /api/v1/attendance/qr-tokens` returning HTTP 500 on some Supabase deployments.
+- QR token random generation now happens in Go using `crypto/rand` instead of depending on PostgreSQL `gen_random_bytes` at insert time.
+- Added UUID validation for `branch_id` so frontend mistakes return clear HTTP 400 instead of database errors.
+- Added migration `0004_v5_6_qr_token_repair.sql` to repair older QR tables where `expires_at` was still `NOT NULL`.
+- Added Supabase SQL Editor repair patch: `docs/SUPABASE_SQL_EDITOR_V5_6_QR_500_FIX.sql`.
+- Added safer server logs for QR database creation errors.

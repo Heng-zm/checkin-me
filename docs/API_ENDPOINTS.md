@@ -673,3 +673,34 @@ X-Device-Secret: <DEVICE_WEBHOOK_SECRET>
 4. Keep `AUTO_MIGRATE=true` for first deploy; after production stabilizes, consider controlled migrations in CI/CD.
 5. Keep bank payout in `manual_csv` mode until the bank gives official API specs, credentials, signing, and sandbox/test environment.
 6. This API stores face scores/events only; do not store raw biometric templates in this system unless you add encrypted biometric vault controls.
+
+### QR Token 500 troubleshooting
+
+If `POST /api/v1/attendance/qr-tokens` returns HTTP 500 after upgrading from an older version:
+
+1. Confirm Render env has `AUTO_MIGRATE=true` and `DB_SCHEMA=checkinme`.
+2. Redeploy the latest code.
+3. If it still fails, run `docs/SUPABASE_SQL_EDITOR_V5_6_QR_500_FIX.sql` in Supabase SQL Editor.
+4. Confirm your request uses a real branch UUID from `GET /api/v1/branches`.
+
+Example branch lookup:
+
+```bash
+curl https://YOUR_RENDER_URL.onrender.com/api/v1/branches \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Example QR request:
+
+```bash
+curl -X POST https://YOUR_RENDER_URL.onrender.com/api/v1/attendance/qr-tokens \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "branch_id":"PASTE_REAL_BRANCH_UUID_HERE",
+    "label":"Main Office QR",
+    "no_expiry":true,
+    "require_gps":true,
+    "qr_size_px":512
+  }'
+```

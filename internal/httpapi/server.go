@@ -3,9 +3,11 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2014,6 +2016,37 @@ func (s *Server) createScheduleAssignment(w http.ResponseWriter, r *http.Request
 	writeJSON(w, 201, map[string]any{"ok": true, "id": id})
 }
 
+func looksLikeUUID(v string) bool {
+	v = strings.TrimSpace(v)
+	if len(v) != 36 {
+		return false
+	}
+	for i, c := range v {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func randomHexToken(byteLen int) (string, error) {
+	if byteLen < 16 {
+		byteLen = 16
+	}
+	b := make([]byte, byteLen)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
 func (s *Server) createAttendanceQRToken(w http.ResponseWriter, r *http.Request) {
 	claims := middleware.Claims(r)
 	var req struct {
@@ -2031,8 +2064,13 @@ func (s *Server) createAttendanceQRToken(w http.ResponseWriter, r *http.Request)
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	req.BranchID = strings.TrimSpace(req.BranchID)
 	if req.BranchID == "" {
-		writeError(w, 400, "branch_id is required")
+		writeError(w, 400, "branch_id is required. Create or select a branch first, then use that branch id to generate the QR token")
+		return
+	}
+	if !looksLikeUUID(req.BranchID) {
+		writeError(w, 400, "branch_id must be a valid UUID. Use GET /api/v1/branches to copy the branch id")
 		return
 	}
 	if req.AllowedRadiusM != nil && *req.AllowedRadiusM <= 0 {
@@ -2106,10 +2144,17 @@ func (s *Server) createAttendanceQRToken(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var id, token string
-	var expires pgtype.Timestamptz
-	err := s.db.QueryRow(ctx, `INSERT INTO attendance_qr_tokens(org_id,branch_id,created_by,token,label,expires_at,require_gps,allowed_radius_m) VALUES($1,$2,$3,encode(gen_random_bytes(24),'hex'),$4,$5,$6,$7) RETURNING id,token,expires_at`, claims.OrgID, req.BranchID, claims.UserID, nullIfEmpty(req.Label), expiresAt, requireGPS, req.AllowedRadiusM).Scan(&id, &token, &expires)
+	token, err := randomHexToken(24)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		log.Printf("qr token random generation error: %v", err)
+		writeError(w, 500, "failed to generate secure QR token")
+		return
+	}
+	var expires pgtype.Timestamptz
+	err = s.db.QueryRow(ctx, `INSERT INTO attendance_qr_tokens(org_id,branch_id,created_by,token,label,expires_at,require_gps,allowed_radius_m) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,token,expires_at`, claims.OrgID, req.BranchID, claims.UserID, token, nullIfEmpty(req.Label), expiresAt, requireGPS, req.AllowedRadiusM).Scan(&id, &token, &expires)
+	if err != nil {
+		log.Printf("create qr token db error org_id=%s branch_id=%s user_id=%s no_expiry=%t: %v", claims.OrgID, req.BranchID, claims.UserID, noExpiry, err)
+		writeError(w, 500, "failed to create QR token. Check that v5.4/v5.6 QR migrations are applied and branch_id belongs to your organization")
 		return
 	}
 	qrPNG, err := qrcode.Encode(token, qrcode.Medium, req.QRSizePX)
