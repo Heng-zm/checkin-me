@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS device_events (
     org_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     device_sn TEXT NOT NULL,
+    external_event_id TEXT,
     event_type TEXT NOT NULL,
     event_at TIMESTAMPTZ NOT NULL,
     face_score NUMERIC(5,2),
@@ -273,6 +274,10 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_audit_org_time ON audit_logs(org_id, created_at DESC);
+
+ALTER TABLE device_events ADD COLUMN IF NOT EXISTS external_event_id TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_device_events_external_id ON device_events(org_id, device_sn, external_event_id) WHERE external_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_device_events_org_time ON device_events(org_id, event_at DESC);
 
 -- Extended CheckinMe modules: department schedule builder, QR attendance, bank batches, and EWA.
 CREATE TABLE IF NOT EXISTS departments (
@@ -331,13 +336,13 @@ CREATE TABLE IF NOT EXISTS attendance_qr_tokens (
     created_by UUID REFERENCES users(id) ON DELETE SET NULL,
     token TEXT NOT NULL UNIQUE,
     label TEXT,
-    expires_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ,
     require_gps BOOLEAN NOT NULL DEFAULT TRUE,
     allowed_radius_m INT,
     scan_count INT NOT NULL DEFAULT 0,
     active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CHECK (expires_at > created_at),
+    CHECK (expires_at IS NULL OR expires_at > created_at),
     CHECK (allowed_radius_m IS NULL OR allowed_radius_m > 0)
 );
 CREATE INDEX IF NOT EXISTS idx_qr_tokens_org_token ON attendance_qr_tokens(org_id, token);

@@ -54,6 +54,12 @@ services:
         value: 60
       - key: ASYNC_WORKER_LIMIT
         value: 6
+      - key: RATE_LIMIT_ENABLED
+        value: true
+      - key: RATE_LIMIT_REQUESTS_PER_MINUTE
+        value: 240
+      - key: RATE_LIMIT_BURST
+        value: 80
       - key: FRAUD_WARN_SCORE
         value: 40
       - key: FRAUD_BLOCK_SCORE

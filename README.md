@@ -19,6 +19,8 @@ curl https://YOUR_RENDER_URL.onrender.com/health
   - Mobile clock-in / clock-out
   - GPS geofence verification against branch radius
   - Localized QR token clocking
+  - QR token generation now returns a scan-ready PNG image/data URL for dashboards
+  - Owner/admin configurable QR expiry, including permanent no-expiry wall QR codes
   - AI face-scan compatible clocking
   - Face-device webhook support
   - Telegram attendance alerts and daily reports
@@ -116,6 +118,50 @@ Use the returned token:
 
 ```bash
 Authorization: Bearer <token>
+```
+
+
+## API Endpoint Documentation
+
+The complete endpoint reference is available here:
+
+- `docs/API_ENDPOINTS.md` — full route list, roles, query params, payload examples, QR token image usage, face-device webhook examples, payroll/bank/EWA APIs.
+- `docs/HTTP_EXAMPLES.md` — quick curl examples for common workflows.
+
+Important v5.4 QR endpoints:
+
+```text
+POST /api/v1/attendance/qr-tokens
+POST /api/v1/attendance/clock
+```
+
+QR token creation now returns:
+
+```json
+{
+  "qr_image_data_url": "data:image/png;base64,...",
+  "qr_image_base64": "...",
+  "qr_content": "token-value",
+  "expires_at": null
+}
+```
+
+For a permanent wall QR code, send:
+
+```json
+{
+  "branch_id": "branch-uuid",
+  "label": "Permanent Office QR",
+  "no_expiry": true,
+  "require_gps": true,
+  "qr_size_px": 512
+}
+```
+
+Frontend display:
+
+```html
+<img src="RESPONSE.qr_image_data_url" alt="Attendance QR" />
 ```
 
 ## Main Endpoints
@@ -342,3 +388,14 @@ See `docs/ANTI_FRAUD_V2.md` and `docs/PERFORMANCE_V2.md` for details.
 ## Existing Supabase tables
 
 If your Supabase `public` schema already contains tables like `users`, `hosted_sites`, or bot tables, keep `DB_SCHEMA=checkinme`. The API will create and use the separate `checkinme` schema, so the migration will not conflict with your existing public tables.
+
+
+## v5.3 optimization update
+
+- Built-in API rate limiting for Render/Supabase deployments.
+- Device webhook alias: `POST /api/v1/device/face-webhook`.
+- Device webhooks support `employee_code`, `external_event_id`, and both device secret headers.
+- Migration advisory lock to avoid concurrent startup migration races.
+- Dockerfile hardened with non-root runtime user and smaller Go binary.
+
+See `docs/V5_3_OPTIMIZATION.md` for details.

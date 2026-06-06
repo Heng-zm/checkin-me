@@ -31,6 +31,9 @@ type Config struct {
 	SlowRequestMS         int
 	CacheTTLSeconds       int
 	AsyncWorkerLimit      int
+	RateLimitEnabled      bool
+	RateLimitRPM          int
+	RateLimitBurst        int
 	FraudWarnScore        int
 	FraudBlockScore       int
 	FraudMaxSpeedKPH      float64
@@ -63,6 +66,9 @@ func Load() Config {
 		SlowRequestMS:         envInt("SLOW_REQUEST_MS", 700),
 		CacheTTLSeconds:       envInt("CACHE_TTL_SECONDS", 60),
 		AsyncWorkerLimit:      envInt("ASYNC_WORKER_LIMIT", 8),
+		RateLimitEnabled:      envBool("RATE_LIMIT_ENABLED", true),
+		RateLimitRPM:          envInt("RATE_LIMIT_REQUESTS_PER_MINUTE", 240),
+		RateLimitBurst:        envInt("RATE_LIMIT_BURST", 80),
 		FraudWarnScore:        envInt("FRAUD_WARN_SCORE", 40),
 		FraudBlockScore:       envInt("FRAUD_BLOCK_SCORE", 100),
 		FraudMaxSpeedKPH:      envFloat("FRAUD_MAX_SPEED_KPH", 180),
@@ -120,6 +126,12 @@ func (c Config) Validate() error {
 	}
 	if c.CacheTTLSeconds < 0 {
 		return fmt.Errorf("CACHE_TTL_SECONDS cannot be negative")
+	}
+	if c.RateLimitRPM < 1 {
+		return fmt.Errorf("RATE_LIMIT_REQUESTS_PER_MINUTE must be greater than 0")
+	}
+	if c.RateLimitBurst < 1 {
+		return fmt.Errorf("RATE_LIMIT_BURST must be greater than 0")
 	}
 	if c.FraudWarnScore < 1 || c.FraudBlockScore < c.FraudWarnScore {
 		return fmt.Errorf("fraud scores must satisfy 1 <= FRAUD_WARN_SCORE <= FRAUD_BLOCK_SCORE")

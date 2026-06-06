@@ -1,5 +1,18 @@
 # Changelog
 
+## v5.4 - QR Image Generation and No-Expiry QR Tokens
+
+- Fixed QR token generation so the API now returns a scan-ready PNG QR image.
+- Added `qr_image_data_url`, `qr_image_base64`, `qr_content`, and QR metadata to the create QR token response.
+- Added configurable QR image size through `qr_size_px` with safe bounds.
+- Removed the old 24-hour QR TTL cap.
+- Added `expires_at` support for owner/admin-selected exact expiry times.
+- Added `no_expiry` / `unlimited` support for permanent wall QR codes.
+- Updated QR validation so tokens with `expires_at=null` never expire while still requiring active status and GPS rules.
+- Added migration `0003_v5_4_qr_image_no_expiry.sql`.
+- Added `docs/SUPABASE_SQL_EDITOR_V5_4_QR_PATCH.sql`.
+
+
 ## v5.2 - Supabase schema isolation fix
 - Added `DB_SCHEMA=checkinme` support.
 - App connections now set `search_path` to the configured schema.
@@ -55,3 +68,19 @@
 
 - Updated Dockerfile to build with `go build -mod=mod` so Render can resolve missing `go.sum` entries during Docker builds.
 - Added `docs/RENDER_BUILD_FIX.md`.
+
+## v5.3 - API Optimization, Device Webhook Compatibility, and Performance Hardening
+
+- Added built-in per-IP token-bucket rate limiting with Render proxy header support.
+- Added `RATE_LIMIT_ENABLED`, `RATE_LIMIT_REQUESTS_PER_MINUTE`, and `RATE_LIMIT_BURST` settings.
+- Added rate-limit visibility to `/api/v1/system/performance`.
+- Added `/ready` health alias for platform readiness checks.
+- Added legacy-compatible `/api/v1/device/face-webhook` route in addition to `/api/v1/devices/face-events`.
+- Device webhooks now accept both `X-Device-Webhook-Secret` and `X-Device-Secret` headers.
+- Device webhook secret comparison now uses constant-time comparison.
+- Face-device webhooks can identify employees by `employee_code` or `user_id`.
+- Added `external_event_id` idempotency support for face-device webhooks to prevent duplicate punches.
+- Added face-device fraud flags for missing, low, or borderline face scores.
+- Added migration advisory lock to prevent concurrent Render instances from applying migrations at the same time.
+- Added `device_events.external_event_id` and unique idempotency index.
+- Hardened Dockerfile for Render builds, smaller binary output, and non-root runtime user.

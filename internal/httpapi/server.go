@@ -3,6 +3,8 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -13,13 +15,16 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"github.com/hengk7401/checkinme-go-api/internal/cache"
 	"github.com/hengk7401/checkinme-go-api/internal/config"
@@ -34,6 +39,13 @@ type Server struct {
 	telegram *services.TelegramClient
 	cache    *cache.MemoryCache
 	asyncSem chan struct{}
+	rateMu   sync.Mutex
+	rateMap  map[string]*rateBucket
+}
+
+type rateBucket struct {
+	tokens  float64
+	updated time.Time
 }
 
 func NewServer(cfg config.Config, db *pgxpool.Pool, telegram *services.TelegramClient) *Server {
@@ -41,7 +53,7 @@ func NewServer(cfg config.Config, db *pgxpool.Pool, telegram *services.TelegramC
 	if limit <= 0 {
 		limit = 8
 	}
-	return &Server{cfg: cfg, db: db, telegram: telegram, cache: cache.NewMemoryCache(), asyncSem: make(chan struct{}, limit)}
+	return &Server{cfg: cfg, db: db, telegram: telegram, cache: cache.NewMemoryCache(), asyncSem: make(chan struct{}, limit), rateMap: make(map[string]*rateBucket)}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -49,15 +61,17 @@ func (s *Server) Routes() http.Handler {
 	r.Use(recoverMiddleware)
 	r.Use(securityHeadersMiddleware)
 	r.Use(s.requestTimeoutMiddleware)
+	r.Use(s.rateLimitMiddleware)
 	r.Use(s.requestLogMiddleware)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   s.cfg.CorsAllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Device-Secret"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Device-Secret", "X-Device-Webhook-Secret", "Idempotency-Key"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
 	r.Get("/health", s.health)
+	r.Get("/ready", s.health)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/setup", s.setup)
@@ -131,6 +145,7 @@ func (s *Server) Routes() http.Handler {
 			r.With(middleware.RequireRoles("owner", "admin")).Get("/system/performance", s.systemPerformance)
 		})
 		r.Post("/devices/face-events", s.faceDeviceEvent)
+		r.Post("/device/face-webhook", s.faceDeviceEvent)
 	})
 	return r
 }
@@ -1559,28 +1574,44 @@ func (s *Server) payrollPayoutExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) faceDeviceEvent(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.DeviceWebhookSecret != "" && r.Header.Get("X-Device-Secret") != s.cfg.DeviceWebhookSecret {
+	providedSecret := firstNonEmpty(r.Header.Get("X-Device-Webhook-Secret"), r.Header.Get("X-Device-Secret"))
+	if s.cfg.DeviceWebhookSecret != "" && subtle.ConstantTimeCompare([]byte(providedSecret), []byte(s.cfg.DeviceWebhookSecret)) != 1 {
 		writeError(w, 401, "invalid device secret")
 		return
 	}
 	var req struct {
-		OrgID     string   `json:"org_id"`
-		UserID    string   `json:"user_id"`
-		DeviceSN  string   `json:"device_sn"`
-		EventType string   `json:"event_type"`
-		EventAt   string   `json:"event_at"`
-		FaceScore *float64 `json:"face_score"`
-		Lat       *float64 `json:"lat"`
-		Lng       *float64 `json:"lng"`
+		OrgID           string   `json:"org_id"`
+		UserID          string   `json:"user_id"`
+		EmployeeCode    string   `json:"employee_code"`
+		DeviceSN        string   `json:"device_sn"`
+		EventType       string   `json:"event_type"`
+		EventAt         string   `json:"event_at"`
+		ExternalEventID string   `json:"external_event_id"`
+		FaceScore       *float64 `json:"face_score"`
+		Lat             *float64 `json:"lat"`
+		Lng             *float64 `json:"lng"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.OrgID == "" || req.UserID == "" || req.DeviceSN == "" {
-		writeError(w, 400, "org_id, user_id and device_sn are required")
+	req.OrgID = strings.TrimSpace(req.OrgID)
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.EmployeeCode = strings.TrimSpace(req.EmployeeCode)
+	req.DeviceSN = strings.TrimSpace(req.DeviceSN)
+	req.ExternalEventID = strings.TrimSpace(req.ExternalEventID)
+	if req.OrgID == "" || req.DeviceSN == "" || (req.UserID == "" && req.EmployeeCode == "") {
+		writeError(w, 400, "org_id, device_sn, and either user_id or employee_code are required")
 		return
 	}
-	eventType := strings.ToLower(req.EventType)
+	if !validOptionalLatLng(req.Lat, req.Lng) {
+		writeError(w, 400, "lat/lng must both be provided and valid")
+		return
+	}
+	if req.FaceScore != nil && (*req.FaceScore < 0 || *req.FaceScore > 100) {
+		writeError(w, 400, "face_score must be between 0 and 100")
+		return
+	}
+	eventType := strings.ToLower(strings.TrimSpace(req.EventType))
 	if eventType == "" {
 		eventType = "in"
 	}
@@ -1590,9 +1621,12 @@ func (s *Server) faceDeviceEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	at := time.Now().UTC()
 	if req.EventAt != "" {
-		if p, err := time.Parse(time.RFC3339, req.EventAt); err == nil {
-			at = p
+		p, err := time.Parse(time.RFC3339, req.EventAt)
+		if err != nil {
+			writeError(w, 400, "event_at must be RFC3339, for example 2026-06-06T09:00:00Z")
+			return
 		}
+		at = p.UTC()
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -1602,14 +1636,62 @@ func (s *Server) faceDeviceEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(ctx)
+	if req.UserID == "" {
+		err = tx.QueryRow(ctx, `SELECT id FROM users WHERE org_id=$1 AND employee_code=$2 AND active=true`, req.OrgID, req.EmployeeCode).Scan(&req.UserID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 404, "employee_code not found")
+			return
+		}
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	} else {
+		var active bool
+		err = tx.QueryRow(ctx, `SELECT active FROM users WHERE org_id=$1 AND id=$2`, req.OrgID, req.UserID).Scan(&active)
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 404, "user_id not found")
+			return
+		}
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		if !active {
+			writeError(w, 400, "user is inactive")
+			return
+		}
+	}
+	if req.ExternalEventID != "" {
+		var existingID string
+		err = tx.QueryRow(ctx, `SELECT id FROM device_events WHERE org_id=$1 AND device_sn=$2 AND external_event_id=$3`, req.OrgID, req.DeviceSN, req.ExternalEventID).Scan(&existingID)
+		if err == nil {
+			writeJSON(w, 200, map[string]any{"ok": true, "duplicate": true, "device_event_id": existingID})
+			return
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
 	raw, _ := json.Marshal(req)
+	fraudStatus := "normal"
+	fraudScore := 0
+	fraudReasons := []string{"no fraud signal detected"}
+	if req.FaceScore == nil {
+		fraudStatus, fraudScore, fraudReasons = "needs_review", 45, []string{"face device event missing face_score"}
+	} else if *req.FaceScore < 70 {
+		fraudStatus, fraudScore, fraudReasons = "needs_review", 70, []string{fmt.Sprintf("low face device score %.2f", *req.FaceScore)}
+	} else if *req.FaceScore < 80 {
+		fraudStatus, fraudScore, fraudReasons = "warning", 30, []string{fmt.Sprintf("borderline face device score %.2f", *req.FaceScore)}
+	}
 	var devID, eventID string
-	err = tx.QueryRow(ctx, `INSERT INTO device_events(org_id,user_id,device_sn,event_type,event_at,face_score,raw_payload) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`, req.OrgID, req.UserID, req.DeviceSN, eventType, at, req.FaceScore, raw).Scan(&devID)
+	err = tx.QueryRow(ctx, `INSERT INTO device_events(org_id,user_id,device_sn,event_type,event_at,external_event_id,face_score,raw_payload) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),$7,$8) RETURNING id`, req.OrgID, req.UserID, req.DeviceSN, eventType, at, req.ExternalEventID, req.FaceScore, raw).Scan(&devID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	err = tx.QueryRow(ctx, `INSERT INTO attendance_events(org_id,user_id,kind,event_at,lat,lng,source,device_sn,face_score) VALUES($1,$2,$3,$4,$5,$6,'face_device',$7,$8) RETURNING id`, req.OrgID, req.UserID, eventType, at, req.Lat, req.Lng, req.DeviceSN, req.FaceScore).Scan(&eventID)
+	err = tx.QueryRow(ctx, `INSERT INTO attendance_events(org_id,user_id,kind,event_at,lat,lng,source,device_sn,face_score,fraud_status,fraud_score,fraud_reasons) VALUES($1,$2,$3,$4,$5,$6,'face_device',$7,$8,$9,$10,$11) RETURNING id`, req.OrgID, req.UserID, eventType, at, req.Lat, req.Lng, req.DeviceSN, req.FaceScore, fraudStatus, fraudScore, fraudReasons).Scan(&eventID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -1638,12 +1720,15 @@ func (s *Server) faceDeviceEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	if fraudStatus != "normal" {
+		_ = s.writeAudit(ctx, tx, req.OrgID, req.UserID, "attendance.face_device_warning", "attendance_event", eventID, map[string]any{"score": fraudScore, "reasons": fraudReasons})
+	}
 	if err := tx.Commit(ctx); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	s.invalidateOrgCaches(req.OrgID)
-	writeJSON(w, 201, map[string]any{"ok": true, "device_event_id": devID, "attendance_event_id": eventID})
+	writeJSON(w, 201, map[string]any{"ok": true, "device_event_id": devID, "attendance_event_id": eventID, "fraud_status": fraudStatus, "fraud_score": fraudScore, "fraud_reasons": fraudReasons})
 }
 
 func (s *Server) reportSummary(w http.ResponseWriter, r *http.Request) {
@@ -1934,7 +2019,12 @@ func (s *Server) createAttendanceQRToken(w http.ResponseWriter, r *http.Request)
 	var req struct {
 		BranchID       string `json:"branch_id"`
 		Label          string `json:"label"`
-		TTLMinutes     int    `json:"ttl_minutes"`
+		TTLMinutes     *int   `json:"ttl_minutes"`
+		TTLHours       *int   `json:"ttl_hours"`
+		ExpiresAt      string `json:"expires_at"`
+		NoExpiry       bool   `json:"no_expiry"`
+		Unlimited      bool   `json:"unlimited"`
+		QRSizePX       int    `json:"qr_size_px"`
 		RequireGPS     *bool  `json:"require_gps"`
 		AllowedRadiusM *int   `json:"allowed_radius_m"`
 	}
@@ -1945,16 +2035,60 @@ func (s *Server) createAttendanceQRToken(w http.ResponseWriter, r *http.Request)
 		writeError(w, 400, "branch_id is required")
 		return
 	}
-	if req.TTLMinutes <= 0 {
-		req.TTLMinutes = 480
-	}
-	if req.TTLMinutes > 1440 {
-		writeError(w, 400, "ttl_minutes cannot exceed 1440")
-		return
-	}
 	if req.AllowedRadiusM != nil && *req.AllowedRadiusM <= 0 {
 		writeError(w, 400, "allowed_radius_m must be positive")
 		return
+	}
+	if req.QRSizePX == 0 {
+		req.QRSizePX = 512
+	}
+	if req.QRSizePX < 128 || req.QRSizePX > 1024 {
+		writeError(w, 400, "qr_size_px must be between 128 and 1024")
+		return
+	}
+	noExpiry := req.NoExpiry || req.Unlimited || (req.TTLMinutes != nil && *req.TTLMinutes == 0)
+	if noExpiry && claims.Role != "owner" && claims.Role != "admin" {
+		writeError(w, 403, "only owner or admin can create no-expiry QR tokens")
+		return
+	}
+	now := time.Now().UTC()
+	var expiresAt *time.Time
+	if !noExpiry {
+		if strings.TrimSpace(req.ExpiresAt) != "" {
+			parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(req.ExpiresAt))
+			if err != nil {
+				writeError(w, 400, "expires_at must be RFC3339, example: 2026-06-06T18:00:00+07:00")
+				return
+			}
+			parsed = parsed.UTC()
+			if !parsed.After(now) {
+				writeError(w, 400, "expires_at must be in the future")
+				return
+			}
+			expiresAt = &parsed
+		} else {
+			ttlMinutes := 480
+			if req.TTLHours != nil {
+				if *req.TTLHours <= 0 {
+					writeError(w, 400, "ttl_hours must be positive, or use no_expiry=true")
+					return
+				}
+				ttlMinutes = *req.TTLHours * 60
+			} else if req.TTLMinutes != nil {
+				if *req.TTLMinutes < 0 {
+					writeError(w, 400, "ttl_minutes cannot be negative")
+					return
+				}
+				if *req.TTLMinutes == 0 {
+					// Already handled as no-expiry above. This guard is kept for clarity.
+					writeError(w, 400, "ttl_minutes=0 requires owner/admin no-expiry mode")
+					return
+				}
+				ttlMinutes = *req.TTLMinutes
+			}
+			expires := now.Add(time.Duration(ttlMinutes) * time.Minute)
+			expiresAt = &expires
+		}
 	}
 	requireGPS := true
 	if req.RequireGPS != nil {
@@ -1972,13 +2106,38 @@ func (s *Server) createAttendanceQRToken(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var id, token string
-	var expires time.Time
-	err := s.db.QueryRow(ctx, `INSERT INTO attendance_qr_tokens(org_id,branch_id,created_by,token,label,expires_at,require_gps,allowed_radius_m) VALUES($1,$2,$3,encode(gen_random_bytes(24),'hex'),$4,now()+($5::text || ' minutes')::interval,$6,$7) RETURNING id,token,expires_at`, claims.OrgID, req.BranchID, claims.UserID, nullIfEmpty(req.Label), req.TTLMinutes, requireGPS, req.AllowedRadiusM).Scan(&id, &token, &expires)
+	var expires pgtype.Timestamptz
+	err := s.db.QueryRow(ctx, `INSERT INTO attendance_qr_tokens(org_id,branch_id,created_by,token,label,expires_at,require_gps,allowed_radius_m) VALUES($1,$2,$3,encode(gen_random_bytes(24),'hex'),$4,$5,$6,$7) RETURNING id,token,expires_at`, claims.OrgID, req.BranchID, claims.UserID, nullIfEmpty(req.Label), expiresAt, requireGPS, req.AllowedRadiusM).Scan(&id, &token, &expires)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, map[string]any{"ok": true, "id": id, "token": token, "expires_at": expires, "clock_payload": map[string]any{"source": "qr", "qr_token": token, "kind": "in"}})
+	qrPNG, err := qrcode.Encode(token, qrcode.Medium, req.QRSizePX)
+	if err != nil {
+		writeError(w, 500, "failed to generate QR image")
+		return
+	}
+	qrBase64 := base64.StdEncoding.EncodeToString(qrPNG)
+	var expiresValue any
+	if expires.Valid {
+		expiresValue = expires.Time
+	}
+	writeJSON(w, 201, map[string]any{
+		"ok":                  true,
+		"id":                  id,
+		"token":               token,
+		"qr_content":          token,
+		"qr_image_base64":     qrBase64,
+		"qr_image_data_url":   "data:image/png;base64," + qrBase64,
+		"qr_image_mime_type":  "image/png",
+		"qr_image_size_px":    req.QRSizePX,
+		"expires_at":          expiresValue,
+		"no_expiry":           !expires.Valid,
+		"require_gps":         requireGPS,
+		"allowed_radius_m":    req.AllowedRadiusM,
+		"clock_payload":       map[string]any{"source": "qr", "qr_token": token, "kind": "in"},
+		"mobile_scan_payload": map[string]any{"source": "qr", "qr_token": token},
+	})
 }
 
 func (s *Server) verifyAttendanceEvidence(ctx context.Context, q queryer, orgID, userID string, req attendanceClockRequest) (string, *string, *string, int, string) {
@@ -2006,7 +2165,7 @@ func (s *Server) verifyAttendanceEvidence(ctx context.Context, q queryer, orgID,
 	if source == "qr" {
 		var tokenID string
 		var bID string
-		var expires time.Time
+		var expires pgtype.Timestamptz
 		var requireGPS bool
 		var radius *int
 		err := q.QueryRow(ctx, `SELECT id,branch_id,expires_at,require_gps,allowed_radius_m FROM attendance_qr_tokens WHERE org_id=$1 AND token=$2 AND active=true`, orgID, req.QRToken).Scan(&tokenID, &bID, &expires, &requireGPS, &radius)
@@ -2016,7 +2175,7 @@ func (s *Server) verifyAttendanceEvidence(ctx context.Context, q queryer, orgID,
 		if err != nil {
 			return source, branchID, qrTokenID, 500, err.Error()
 		}
-		if time.Now().UTC().After(expires) {
+		if expires.Valid && time.Now().UTC().After(expires.Time) {
 			return source, branchID, qrTokenID, 400, "QR token expired"
 		}
 		branchID = &bID
@@ -2611,6 +2770,59 @@ func (s *Server) requestTimeoutMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.cfg.RateLimitEnabled || r.Method == http.MethodOptions || r.URL.Path == "/health" || r.URL.Path == "/ready" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rpm := s.cfg.RateLimitRPM
+		if rpm <= 0 {
+			rpm = 240
+		}
+		burst := s.cfg.RateLimitBurst
+		if burst <= 0 {
+			burst = maxInt(1, rpm/3)
+		}
+		key := clientIP(r)
+		now := time.Now()
+		fillPerSecond := float64(rpm) / 60.0
+
+		s.rateMu.Lock()
+		b := s.rateMap[key]
+		if b == nil {
+			b = &rateBucket{tokens: float64(burst), updated: now}
+			s.rateMap[key] = b
+		}
+		elapsed := now.Sub(b.updated).Seconds()
+		if elapsed > 0 {
+			b.tokens = math.Min(float64(burst), b.tokens+elapsed*fillPerSecond)
+			b.updated = now
+		}
+		allowed := b.tokens >= 1
+		if allowed {
+			b.tokens -= 1
+		}
+		// Opportunistic cleanup keeps the map bounded without a background goroutine.
+		if len(s.rateMap) > 5000 {
+			cutoff := now.Add(-10 * time.Minute)
+			for k, v := range s.rateMap {
+				if v.updated.Before(cutoff) {
+					delete(s.rateMap, k)
+				}
+			}
+		}
+		s.rateMu.Unlock()
+
+		if !allowed {
+			w.Header().Set("Retry-After", "60")
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) requestLogMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -2661,6 +2873,9 @@ func (s *Server) writeAudit(ctx context.Context, q queryer, orgID, actorID, acti
 
 func (s *Server) systemPerformance(w http.ResponseWriter, r *http.Request) {
 	stat := s.db.Stat()
+	s.rateMu.Lock()
+	rateClients := len(s.rateMap)
+	s.rateMu.Unlock()
 	writeJSON(w, 200, map[string]any{
 		"ok": true,
 		"cache": map[string]any{
@@ -2671,6 +2886,12 @@ func (s *Server) systemPerformance(w http.ResponseWriter, r *http.Request) {
 		"async": map[string]any{
 			"limit":  cap(s.asyncSem),
 			"in_use": len(s.asyncSem),
+		},
+		"rate_limit": map[string]any{
+			"enabled":             s.cfg.RateLimitEnabled,
+			"requests_per_minute": s.cfg.RateLimitRPM,
+			"burst":               s.cfg.RateLimitBurst,
+			"tracked_clients":     rateClients,
 		},
 		"postgres_pool": map[string]any{
 			"acquire_count":          stat.AcquireCount(),
@@ -2856,6 +3077,33 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
 }
+
+func clientIP(r *http.Request) string {
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if ip := strings.TrimSpace(parts[0]); ip != "" {
+			return ip
+		}
+	}
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
+	}
+	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx > -1 {
+		return r.RemoteAddr[:idx]
+	}
+	return r.RemoteAddr
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func nullIfEmpty(s string) *string {
 	s = strings.TrimSpace(s)
 	if s == "" {

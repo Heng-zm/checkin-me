@@ -16,6 +16,13 @@ var migrationFiles embed.FS
 // Migrate applies embedded SQL migrations. Migration files must be idempotent
 // because Render can restart services and rerun startup code.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, `SELECT pg_advisory_lock(hashtext('checkinme_schema_migrations'))`); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext('checkinme_schema_migrations'))`)
+	}()
+
 	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version TEXT PRIMARY KEY,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()

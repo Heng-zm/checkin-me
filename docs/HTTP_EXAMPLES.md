@@ -94,11 +94,33 @@ curl -X POST http://localhost:8080/api/v1/schedule-assignments \
 
 ### Create Local QR Token for Branch
 
+The response now includes `qr_image_data_url` and `qr_image_base64`, so your dashboard can show the QR image immediately after generation.
+
 ```bash
 curl -X POST http://localhost:8080/api/v1/attendance/qr-tokens \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"branch_id":"<branch_uuid>","label":"Front desk QR","ttl_minutes":480,"require_gps":true}'
+  -d '{"branch_id":"<branch_uuid>","label":"Front desk QR","ttl_minutes":480,"require_gps":true,"qr_size_px":512}'
+```
+
+### Create No-Expiry QR Token for Wall Scan
+
+Only `owner` and `admin` users can create permanent/no-expiry QR tokens.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/attendance/qr-tokens \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"branch_id":"<branch_uuid>","label":"Permanent office QR","no_expiry":true,"require_gps":true,"qr_size_px":512}'
+```
+
+### Create QR Token with Exact Expiry Time
+
+```bash
+curl -X POST http://localhost:8080/api/v1/attendance/qr-tokens \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"branch_id":"<branch_uuid>","label":"Today only QR","expires_at":"2026-06-06T18:00:00+07:00","require_gps":true}'
 ```
 
 ### Clock In by QR + GPS
