@@ -1,26 +1,45 @@
 # Changelog
 
-## v3 — bug fixes and performance improvements
+## v4 - Attendance Anti-Fraud V2 + Performance V2
+
+### Added
+- Attendance Anti-Fraud V2 scoring engine for mobile, GPS, QR, and face-scan clocking.
+- Fraud statuses: `normal`, `warning`, `needs_review`, `blocked`, `reviewed`, `false_positive`, `confirmed`.
+- Fraud signals for mock GPS, poor GPS accuracy, QR replay, duplicate clock events, borderline face scores, missing GPS evidence, and impossible travel speed.
+- Manager fraud alert APIs:
+  - `GET /api/v1/attendance/fraud-alerts`
+  - `PATCH /api/v1/attendance/fraud-alerts/{id}/review`
+- Fraud fields in attendance event/session responses.
+- Configurable fraud thresholds through `.env`.
+- Performance V2 request timeout middleware.
+- Slow request logging.
+- Bounded async worker queue for Telegram/report background work.
+- In-memory TTL cache for dashboard/report summary and Telegram chat ID lookups.
+- `GET /api/v1/system/performance` for PostgreSQL pool, cache, and async worker stats.
+- Pagination for customers, sales visits, and attendance sessions.
+- New database indexes for attendance/report/fraud queries.
 
 ### Fixed
-
-- Payroll calculation no longer runs nested queries while employee rows are still open, preventing pgx connection-busy failures.
-- Approved/paid payroll runs are protected from accidental recalculation.
-- Face scan endpoint now requires `face_score`.
-- Device webhook now rejects duplicate open clock-ins and reports missing open sessions for clock-out events.
-- EWA availability now includes pending requests, not only approved ones.
-
-### Improved
-
-- Added panic recovery middleware and security headers.
-- Added request JSON body limit and strict one-object JSON decoding.
-- Added employee search/pagination.
-- Added route-level privacy restrictions for employee, attendance, CRM, and sales data.
-- Added latitude/longitude, GPS accuracy, QR TTL/radius, shift time, schedule date, salary, and currency validation.
-- Added database pool tuning via env variables.
-- Added indexes and DB constraints for high-traffic attendance, payroll, EWA, QR, and report queries.
+- Fixed duplicate `user_id` column in `payroll_items` migration.
+- Improved report summary by using one SQL round trip instead of multiple separate queries.
+- Invalidates dashboard cache after attendance, employee, sales, and device attendance changes.
 
 ### Notes
+- The memory cache is safe for a single API instance. For multi-instance production, keep the TTL short or replace `internal/cache` with Redis using the same cache interface.
+- Blocked fraud attempts are stored in `audit_logs` and do not create attendance sessions.
 
-- Bank payout remains a draft/manual CSV adapter until a bank-approved API contract, sandbox credentials, signing method, idempotency rules, and callback format are provided.
-- Payroll tax/NSSF defaults are editable rules and must be verified before production payroll.
+## v3 - Stability and validation
+- Fixed payroll generation cursor/connection risk.
+- Added stronger validations, panic recovery, security headers, and pagination.
+
+## v2 - Product module expansion
+- Added QR/GPS/face attendance, schedule builder, payroll exports, EWA, bank batch workflow, and sales route summaries.
+
+
+## v5 Supabase Deployment
+
+- Changed Render Blueprint to use external Supabase Postgres instead of Render Postgres.
+- Added `.env.supabase.example`.
+- Added `docs/SUPABASE_DEPLOY.md`.
+- Added `DB_QUERY_EXEC_MODE` for Supabase transaction-pooler compatibility.
+- Reduced default DB pool size for Supabase-friendly deployment.

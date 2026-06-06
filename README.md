@@ -2,6 +2,17 @@
 
 Production-style REST API starter for a CheckinMe-style HR, attendance, field-sales, payroll, payout, and Earned Wage Access system.
 
+## Deploy to Render
+
+This package includes `render.yaml` for Render deployment with Docker + Supabase Postgres. See `docs/RENDER_DEPLOY.md` and `docs/SUPABASE_DEPLOY.md`.
+
+Quick test after deploy:
+
+```bash
+curl https://YOUR_RENDER_URL.onrender.com/health
+```
+
+
 ## Included modules
 
 - **Smart Attendance System**
@@ -54,17 +65,27 @@ Tax, NSSF, bank payout, and EWA rules can change. This starter stores payroll pe
 ## Stack
 
 - Go 1.22+
-- PostgreSQL 16+
+- PostgreSQL 16+ or Supabase Postgres
 - chi router
 - pgx PostgreSQL driver
 - JWT auth
 - Telegram Bot API via HTTP
 
-## Quick Start
+## Quick Start — local Postgres
 
 ```bash
 cp .env.example .env
 docker compose up -d postgres
+go mod tidy
+go run ./cmd/api
+```
+
+## Quick Start — Supabase Postgres
+
+Copy `.env.supabase.example`, paste your Supabase Session pooler `DATABASE_URL`, then run:
+
+```bash
+cp .env.supabase.example .env
 go mod tidy
 go run ./cmd/api
 ```
@@ -261,4 +282,58 @@ go build ./cmd/api
 ```
 
 The sandbox used to generate this ZIP cannot download external Go modules, so final dependency download must run on your machine/server.
-# checkin-me
+
+
+## v4 update: Attendance Anti-Fraud V2 + Performance V2
+
+### Attendance Anti-Fraud V2
+
+The API now scores every mobile/GPS/QR/face-scan attendance event before saving it. It detects:
+
+- Mock/fake GPS reported by the app.
+- Poor GPS accuracy.
+- Duplicate clock-in/clock-out attempts.
+- QR token replay.
+- Borderline face scores.
+- Missing GPS evidence.
+- Impossible travel speed between two GPS attendance points.
+
+Manager APIs:
+
+```text
+GET   /api/v1/attendance/fraud-alerts
+PATCH /api/v1/attendance/fraud-alerts/{id}/review
+```
+
+### Performance V2
+
+Added:
+
+- Request timeout middleware.
+- Slow request logging.
+- Bounded async worker queue for Telegram/report jobs.
+- In-memory TTL cache for report/dashboard endpoints.
+- Single-query report summary.
+- Pagination for large list APIs.
+- PostgreSQL indexes for attendance, fraud, dashboard, and sales reports.
+- Performance stats endpoint:
+
+```text
+GET /api/v1/system/performance
+```
+
+### New environment variables
+
+```env
+REQUEST_TIMEOUT_SECONDS=15
+SLOW_REQUEST_MS=700
+CACHE_TTL_SECONDS=60
+ASYNC_WORKER_LIMIT=8
+FRAUD_WARN_SCORE=40
+FRAUD_BLOCK_SCORE=100
+FRAUD_MAX_SPEED_KPH=180
+FRAUD_MAX_GPS_ACCURACY_M=80
+FRAUD_DUPLICATE_SECONDS=120
+```
+
+See `docs/ANTI_FRAUD_V2.md` and `docs/PERFORMANCE_V2.md` for details.

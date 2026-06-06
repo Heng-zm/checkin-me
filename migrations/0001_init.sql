@@ -16,6 +16,10 @@ DO $$ BEGIN
     CREATE TYPE payroll_status AS ENUM ('draft', 'approved', 'paid', 'cancelled');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+DO $$ BEGIN
+    CREATE TYPE attendance_fraud_status AS ENUM ('normal', 'warning', 'needs_review', 'blocked', 'reviewed', 'false_positive', 'confirmed');
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 CREATE TABLE IF NOT EXISTS organizations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
@@ -71,10 +75,22 @@ CREATE TABLE IF NOT EXISTS attendance_events (
     source TEXT NOT NULL DEFAULT 'mobile',
     device_sn TEXT,
     face_score NUMERIC(5,2),
+    mock_location BOOLEAN NOT NULL DEFAULT FALSE,
+    device_id TEXT,
+    fraud_status attendance_fraud_status NOT NULL DEFAULT 'normal',
+    fraud_score INT NOT NULL DEFAULT 0,
+    fraud_reasons TEXT[] NOT NULL DEFAULT '{}'::text[],
+    fraud_distance_m INT,
+    fraud_speed_kph NUMERIC(10,2),
+    fraud_reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    fraud_reviewed_at TIMESTAMPTZ,
+    fraud_review_note TEXT,
     note TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK ((lat IS NULL AND lng IS NULL) OR (lat BETWEEN -90 AND 90 AND lng BETWEEN -180 AND 180)),
-    CHECK (gps_accuracy_m IS NULL OR gps_accuracy_m >= 0)
+    CHECK (gps_accuracy_m IS NULL OR gps_accuracy_m >= 0),
+    CHECK (fraud_score >= 0),
+    CHECK (fraud_distance_m IS NULL OR fraud_distance_m >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_attendance_org_time ON attendance_events(org_id, event_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attendance_user_time ON attendance_events(user_id, event_at DESC);
@@ -328,6 +344,18 @@ CREATE INDEX IF NOT EXISTS idx_qr_tokens_org_token ON attendance_qr_tokens(org_i
 
 ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS branch_id UUID REFERENCES branches(id) ON DELETE SET NULL;
 ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS qr_token_id UUID REFERENCES attendance_qr_tokens(id) ON DELETE SET NULL;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS mock_location BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS device_id TEXT;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_status attendance_fraud_status NOT NULL DEFAULT 'normal';
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_score INT NOT NULL DEFAULT 0;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_reasons TEXT[] NOT NULL DEFAULT '{}'::text[];
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_distance_m INT;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_speed_kph NUMERIC(10,2);
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_reviewed_at TIMESTAMPTZ;
+ALTER TABLE attendance_events ADD COLUMN IF NOT EXISTS fraud_review_note TEXT;
+CREATE INDEX IF NOT EXISTS idx_attendance_fraud_org ON attendance_events(org_id, fraud_status, event_at DESC) WHERE fraud_status <> 'normal';
+CREATE INDEX IF NOT EXISTS idx_attendance_qr_replay ON attendance_events(org_id, user_id, qr_token_id, event_at DESC) WHERE qr_token_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS bank_accounts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -401,3 +429,11 @@ ALTER TABLE payroll_items ADD COLUMN IF NOT EXISTS ewa_deduction_cents BIGINT NO
 CREATE INDEX IF NOT EXISTS idx_payroll_runs_org_month ON payroll_runs(org_id, month DESC);
 CREATE INDEX IF NOT EXISTS idx_payroll_items_user ON payroll_items(user_id);
 CREATE INDEX IF NOT EXISTS idx_qr_tokens_expiry ON attendance_qr_tokens(org_id, active, expires_at);
+
+
+-- Attendance Anti-Fraud V2 and Performance V2 indexes.
+CREATE INDEX IF NOT EXISTS idx_attendance_events_org_kind_time ON attendance_events(org_id, kind, event_at DESC);
+CREATE INDEX IF NOT EXISTS idx_attendance_events_user_kind_time ON attendance_events(org_id, user_id, kind, event_at DESC);
+CREATE INDEX IF NOT EXISTS idx_attendance_events_user_gps_time ON attendance_events(org_id, user_id, event_at DESC) WHERE lat IS NOT NULL AND lng IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_visits_user_time ON sales_visits(org_id, user_id, check_in_at DESC);
+CREATE INDEX IF NOT EXISTS idx_users_org_active ON users(org_id, active);

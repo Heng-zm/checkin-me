@@ -162,3 +162,47 @@ curl -X POST http://localhost:8080/api/v1/ewa/requests \
   -H 'Content-Type: application/json' \
   -d '{"amount_cents":5000,"reason":"Emergency family expense"}'
 ```
+
+## Attendance Anti-Fraud V2
+
+Clock in with app-side mock location detection:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/attendance/clock \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind":"in",
+    "source":"gps",
+    "lat":11.5564,
+    "lng":104.9282,
+    "gps_accuracy_m":12,
+    "mock_location":false,
+    "device_id":"iphone-001"
+  }'
+```
+
+List suspicious attendance alerts:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/api/v1/attendance/fraud-alerts?from=2026-06-01&to=2026-06-30&limit=50&offset=0"
+```
+
+Review fraud alert:
+
+```bash
+curl -X PATCH http://localhost:8080/api/v1/attendance/fraud-alerts/$EVENT_ID/review \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"status":"confirmed","note":"Manager verified suspicious GPS jump."}'
+```
+
+## Performance V2
+
+Check server performance counters:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/api/v1/system/performance
+```

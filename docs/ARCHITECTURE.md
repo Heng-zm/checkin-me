@@ -53,3 +53,21 @@ The API accepts face-device attendance events and face confidence scores. It doe
 - Run `go test ./...` and database migration tests before deploy.
 - Add object storage for exports if files need to be persisted.
 - Add bank adapter only after receiving official bank API documentation.
+
+## v4 Attendance Anti-Fraud V2 flow
+
+1. Employee sends clock payload from mobile app, QR scan, GPS, or face scan.
+2. API validates base evidence: QR token, face score, GPS/geofence rules.
+3. Anti-fraud scorer checks mock GPS, GPS accuracy, QR replay, duplicate actions, missing GPS, face score risk, and impossible travel speed.
+4. If score reaches `FRAUD_BLOCK_SCORE`, API rejects the clock event and writes an audit log.
+5. If score reaches warning/review threshold, API saves attendance with `fraud_status` and notifies Telegram with a warning.
+6. Managers review alerts from `/attendance/fraud-alerts`.
+
+## v4 Performance V2 flow
+
+- Request-level timeouts are applied globally.
+- Slow requests and 5xx responses are logged.
+- Telegram/background jobs are executed through a bounded async worker queue.
+- Dashboard/report summary uses one SQL query and a short TTL cache.
+- Write actions invalidate organization dashboard caches.
+- `/system/performance` exposes PostgreSQL pool stats, cache size, and worker usage.

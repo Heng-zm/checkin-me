@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hengk7401/checkinme-go-api/internal/cache"
 	"github.com/hengk7401/checkinme-go-api/internal/config"
 	"github.com/hengk7401/checkinme-go-api/internal/middleware"
 	"github.com/hengk7401/checkinme-go-api/internal/security"
@@ -31,16 +32,24 @@ type Server struct {
 	cfg      config.Config
 	db       *pgxpool.Pool
 	telegram *services.TelegramClient
+	cache    *cache.MemoryCache
+	asyncSem chan struct{}
 }
 
 func NewServer(cfg config.Config, db *pgxpool.Pool, telegram *services.TelegramClient) *Server {
-	return &Server{cfg: cfg, db: db, telegram: telegram}
+	limit := cfg.AsyncWorkerLimit
+	if limit <= 0 {
+		limit = 8
+	}
+	return &Server{cfg: cfg, db: db, telegram: telegram, cache: cache.NewMemoryCache(), asyncSem: make(chan struct{}, limit)}
 }
 
 func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(recoverMiddleware)
 	r.Use(securityHeadersMiddleware)
+	r.Use(s.requestTimeoutMiddleware)
+	r.Use(s.requestLogMiddleware)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   s.cfg.CorsAllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -76,6 +85,8 @@ func (s *Server) Routes() http.Handler {
 			r.With(middleware.RequireRoles("owner", "admin", "manager")).Post("/attendance/qr-tokens", s.createAttendanceQRToken)
 			r.Get("/attendance/today", s.attendanceToday)
 			r.Get("/attendance/sessions", s.attendanceSessions)
+			r.With(middleware.RequireRoles("owner", "admin", "manager")).Get("/attendance/fraud-alerts", s.attendanceFraudAlerts)
+			r.With(middleware.RequireRoles("owner", "admin", "manager")).Patch("/attendance/fraud-alerts/{id}/review", s.reviewAttendanceFraudAlert)
 
 			r.Post("/leave/requests", s.createLeaveRequest)
 			r.Get("/leave/requests", s.listLeaveRequests)
@@ -117,6 +128,7 @@ func (s *Server) Routes() http.Handler {
 			r.Get("/reports/summary", s.reportSummary)
 			r.Get("/reports/insights", s.reportInsights)
 			r.With(middleware.RequireRoles("owner", "admin", "manager")).Post("/reports/telegram-daily", s.sendDailyTelegramReport)
+			r.With(middleware.RequireRoles("owner", "admin")).Get("/system/performance", s.systemPerformance)
 		})
 		r.Post("/devices/face-events", s.faceDeviceEvent)
 	})
@@ -329,6 +341,7 @@ func (s *Server) createEmployee(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	s.invalidateOrgCaches(claims.OrgID)
 	writeJSON(w, 201, map[string]any{"ok": true, "id": id})
 }
 
@@ -376,6 +389,7 @@ func (s *Server) updateEmployee(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "employee not found")
 		return
 	}
+	s.invalidateOrgCaches(claims.OrgID)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -448,7 +462,19 @@ type attendanceClockRequest struct {
 	Source       string   `json:"source"`
 	QRToken      string   `json:"qr_token"`
 	FaceScore    *float64 `json:"face_score"`
+	MockLocation *bool    `json:"mock_location"`
+	DeviceID     string   `json:"device_id"`
 	Note         string   `json:"note"`
+}
+
+type attendanceFraudAssessment struct {
+	Status         string   `json:"status"`
+	Score          int      `json:"score"`
+	Reasons        []string `json:"reasons"`
+	Blocked        bool     `json:"blocked"`
+	DistanceM      *int     `json:"distance_m,omitempty"`
+	TravelSpeedKPH *float64 `json:"travel_speed_kph,omitempty"`
+	ReviewRequired bool     `json:"review_required"`
 }
 
 func (s *Server) clockAttendance(w http.ResponseWriter, r *http.Request) {
@@ -503,7 +529,19 @@ func (s *Server) handleAttendanceClock(w http.ResponseWriter, r *http.Request, r
 	}
 	var eventID string
 	now := time.Now().UTC()
-	err = tx.QueryRow(ctx, `INSERT INTO attendance_events(org_id, user_id, kind, event_at, lat, lng, gps_accuracy_m, source, branch_id, qr_token_id, face_score, note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, claims.OrgID, claims.UserID, req.Kind, now, req.Lat, req.Lng, req.GPSAccuracyM, source, branchID, qrTokenID, req.FaceScore, nullIfEmpty(req.Note)).Scan(&eventID)
+	fraud, err := s.assessAttendanceFraud(ctx, tx, claims.OrgID, claims.UserID, req.Kind, source, req, branchID, qrTokenID, now)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if fraud.Blocked {
+		_ = s.writeAudit(ctx, tx, claims.OrgID, claims.UserID, "attendance.blocked_by_fraud", "user", claims.UserID, map[string]any{"kind": req.Kind, "source": source, "score": fraud.Score, "reasons": fraud.Reasons})
+		_ = tx.Commit(ctx)
+		writeJSON(w, 403, map[string]any{"ok": false, "error": "attendance blocked by anti-fraud rules", "fraud": fraud})
+		return
+	}
+	deviceID := strings.TrimSpace(req.DeviceID)
+	err = tx.QueryRow(ctx, `INSERT INTO attendance_events(org_id, user_id, kind, event_at, lat, lng, gps_accuracy_m, source, branch_id, qr_token_id, face_score, mock_location, device_id, fraud_status, fraud_score, fraud_reasons, fraud_distance_m, fraud_speed_kph, note) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE($12,false),NULLIF($13,''),$14,$15,$16,$17,$18,$19) RETURNING id`, claims.OrgID, claims.UserID, req.Kind, now, req.Lat, req.Lng, req.GPSAccuracyM, source, branchID, qrTokenID, req.FaceScore, req.MockLocation, deviceID, fraud.Status, fraud.Score, fraud.Reasons, fraud.DistanceM, fraud.TravelSpeedKPH, nullIfEmpty(req.Note)).Scan(&eventID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -551,15 +589,21 @@ func (s *Server) handleAttendanceClock(w http.ResponseWriter, r *http.Request, r
 			return
 		}
 	}
+	if fraud.ReviewRequired {
+		_ = s.writeAudit(ctx, tx, claims.OrgID, claims.UserID, "attendance.fraud_warning", "attendance_event", eventID, map[string]any{"score": fraud.Score, "reasons": fraud.Reasons})
+	}
 	if err := tx.Commit(ctx); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	go s.sendAttendanceTelegram(context.Background(), claims.OrgID, claims.Name, req.Kind, now)
-	writeJSON(w, 201, map[string]any{"ok": true, "event_id": eventID, "session_id": sessionID, "kind": req.Kind, "source": source, "branch_id": branchID, "event_at": now})
+	s.invalidateOrgCaches(claims.OrgID)
+	s.runAsync(func() {
+		s.sendAttendanceTelegram(context.Background(), claims.OrgID, claims.Name, req.Kind, now, fraud)
+	})
+	writeJSON(w, 201, map[string]any{"ok": true, "event_id": eventID, "session_id": sessionID, "kind": req.Kind, "source": source, "branch_id": branchID, "event_at": now, "fraud": fraud})
 }
 
-func (s *Server) sendAttendanceTelegram(ctx context.Context, orgID, name, kind string, at time.Time) {
+func (s *Server) sendAttendanceTelegram(ctx context.Context, orgID, name, kind string, at time.Time, fraud attendanceFraudAssessment) {
 	chatID := s.orgTelegramChatID(ctx, orgID)
 	icon := "✅"
 	label := "Clock In"
@@ -568,15 +612,25 @@ func (s *Server) sendAttendanceTelegram(ctx context.Context, orgID, name, kind s
 		label = "Clock Out"
 	}
 	text := fmt.Sprintf("%s <b>CheckinMe %s</b>\n👤 %s\n🕒 %s", icon, label, services.EscapeHTML(name), at.Format("2006-01-02 15:04 MST"))
+	if fraud.Status != "normal" {
+		text += fmt.Sprintf("\n⚠️ Fraud status: <b>%s</b> (%d)\nReason: %s", services.EscapeHTML(fraud.Status), fraud.Score, services.EscapeHTML(strings.Join(fraud.Reasons, "; ")))
+	}
 	_ = s.telegram.SendMessage(ctx, chatID, text)
 }
 
 func (s *Server) orgTelegramChatID(ctx context.Context, orgID string) string {
+	key := "org_telegram:" + orgID
+	var cached string
+	if s.cache.GetJSON(key, &cached) {
+		return cached
+	}
 	var chatID *string
 	_ = s.db.QueryRow(ctx, `SELECT telegram_chat_id FROM organizations WHERE id=$1`, orgID).Scan(&chatID)
 	if chatID != nil {
+		s.cache.SetJSON(key, *chatID, time.Duration(maxInt(30, s.cfg.CacheTTLSeconds))*time.Second)
 		return *chatID
 	}
+	s.cache.SetJSON(key, "", 30*time.Second)
 	return ""
 }
 
@@ -588,7 +642,7 @@ func (s *Server) attendanceToday(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	args := []any{claims.OrgID, start, end}
-	q := `SELECT e.id, e.user_id, u.full_name, e.kind::text, e.event_at, e.lat, e.lng, e.source, e.note FROM attendance_events e JOIN users u ON u.id=e.user_id WHERE e.org_id=$1 AND e.event_at >= $2 AND e.event_at < $3`
+	q := `SELECT e.id, e.user_id, u.full_name, e.kind::text, e.event_at, e.lat, e.lng, e.source, e.fraud_status, e.fraud_score, e.note FROM attendance_events e JOIN users u ON u.id=e.user_id WHERE e.org_id=$1 AND e.event_at >= $2 AND e.event_at < $3`
 	if claims.Role == "employee" || claims.Role == "sales" {
 		q += ` AND e.user_id=$4`
 		args = append(args, claims.UserID)
@@ -602,15 +656,16 @@ func (s *Server) attendanceToday(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, userID, name, kind, source string
+		var id, userID, name, kind, source, fraudStatus string
 		var at time.Time
 		var lat, lng *float64
+		var fraudScore int
 		var note *string
-		if err := rows.Scan(&id, &userID, &name, &kind, &at, &lat, &lng, &source, &note); err != nil {
+		if err := rows.Scan(&id, &userID, &name, &kind, &at, &lat, &lng, &source, &fraudStatus, &fraudScore, &note); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
-		items = append(items, map[string]any{"id": id, "user_id": userID, "full_name": name, "kind": kind, "event_at": at, "lat": lat, "lng": lng, "source": source, "note": note})
+		items = append(items, map[string]any{"id": id, "user_id": userID, "full_name": name, "kind": kind, "event_at": at, "lat": lat, "lng": lng, "source": source, "fraud_status": fraudStatus, "fraud_score": fraudScore, "note": note})
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "events": items})
 }
@@ -622,7 +677,7 @@ func (s *Server) attendanceSessions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	args := []any{claims.OrgID, from, to}
-	q := `SELECT s.id, s.user_id, u.full_name, s.clock_in_at, s.clock_out_at, s.total_minutes, s.late_minutes, s.overtime_minutes FROM attendance_sessions s JOIN users u ON u.id=s.user_id WHERE s.org_id=$1 AND s.clock_in_at >= $2 AND s.clock_in_at < $3`
+	q := `SELECT s.id, s.user_id, u.full_name, s.clock_in_at, s.clock_out_at, s.total_minutes, s.late_minutes, s.overtime_minutes, ci.fraud_status, ci.fraud_score FROM attendance_sessions s JOIN users u ON u.id=s.user_id JOIN attendance_events ci ON ci.id=s.clock_in_id WHERE s.org_id=$1 AND s.clock_in_at >= $2 AND s.clock_in_at < $3`
 	if claims.Role == "employee" || claims.Role == "sales" {
 		q += fmt.Sprintf(` AND s.user_id=$%d`, len(args)+1)
 		args = append(args, claims.UserID)
@@ -630,7 +685,9 @@ func (s *Server) attendanceSessions(w http.ResponseWriter, r *http.Request) {
 		q += fmt.Sprintf(` AND s.user_id=$%d`, len(args)+1)
 		args = append(args, userID)
 	}
-	q += ` ORDER BY s.clock_in_at DESC LIMIT 500`
+	limit, offset := limitOffset(r, 100, 500)
+	q += fmt.Sprintf(` ORDER BY s.clock_in_at DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
 	rows, err := s.db.Query(ctx, q, args...)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -639,17 +696,105 @@ func (s *Server) attendanceSessions(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var id, uid, name string
+		var id, uid, name, fraudStatus string
 		var in time.Time
 		var out *time.Time
-		var total, late, ot int
-		if err := rows.Scan(&id, &uid, &name, &in, &out, &total, &late, &ot); err != nil {
+		var total, late, ot, fraudScore int
+		if err := rows.Scan(&id, &uid, &name, &in, &out, &total, &late, &ot, &fraudStatus, &fraudScore); err != nil {
 			writeError(w, 500, err.Error())
 			return
 		}
-		items = append(items, map[string]any{"id": id, "user_id": uid, "full_name": name, "clock_in_at": in, "clock_out_at": out, "total_minutes": total, "late_minutes": late, "overtime_minutes": ot})
+		items = append(items, map[string]any{"id": id, "user_id": uid, "full_name": name, "clock_in_at": in, "clock_out_at": out, "total_minutes": total, "late_minutes": late, "overtime_minutes": ot, "fraud_status": fraudStatus, "fraud_score": fraudScore})
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "sessions": items})
+	writeJSON(w, 200, map[string]any{"ok": true, "sessions": items, "limit": limit, "offset": offset})
+}
+
+func (s *Server) attendanceFraudAlerts(w http.ResponseWriter, r *http.Request) {
+	claims := middleware.Claims(r)
+	from, to := queryRange(r)
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+	limit, offset := limitOffset(r, 100, 500)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	args := []any{claims.OrgID, from, to}
+	q := `SELECT e.id,e.user_id,u.full_name,e.kind::text,e.event_at,e.source,e.lat,e.lng,e.gps_accuracy_m,e.face_score,e.mock_location,e.fraud_status,e.fraud_score,e.fraud_reasons,e.fraud_distance_m,e.fraud_speed_kph,e.fraud_reviewed_at,e.fraud_review_note
+FROM attendance_events e JOIN users u ON u.id=e.user_id
+WHERE e.org_id=$1 AND e.event_at >= $2 AND e.event_at < $3 AND e.fraud_status <> 'normal'`
+	if status != "" {
+		q += fmt.Sprintf(` AND e.fraud_status=$%d`, len(args)+1)
+		args = append(args, status)
+	}
+	if userID != "" {
+		q += fmt.Sprintf(` AND e.user_id=$%d`, len(args)+1)
+		args = append(args, userID)
+	}
+	q += fmt.Sprintf(` ORDER BY e.fraud_score DESC,e.event_at DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
+	rows, err := s.db.Query(ctx, q, args...)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer rows.Close()
+	items := []map[string]any{}
+	for rows.Next() {
+		var id, uid, name, kind, source, fraudStatus string
+		var at time.Time
+		var lat, lng, faceScore, speed *float64
+		var gpsAccuracy, score, distance *int
+		var mock bool
+		var reasons []string
+		var reviewedAt *time.Time
+		var reviewNote *string
+		if err := rows.Scan(&id, &uid, &name, &kind, &at, &source, &lat, &lng, &gpsAccuracy, &faceScore, &mock, &fraudStatus, &score, &reasons, &distance, &speed, &reviewedAt, &reviewNote); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		items = append(items, map[string]any{"id": id, "user_id": uid, "full_name": name, "kind": kind, "event_at": at, "source": source, "lat": lat, "lng": lng, "gps_accuracy_m": gpsAccuracy, "face_score": faceScore, "mock_location": mock, "fraud_status": fraudStatus, "fraud_score": score, "fraud_reasons": reasons, "fraud_distance_m": distance, "fraud_speed_kph": speed, "reviewed_at": reviewedAt, "review_note": reviewNote})
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "alerts": items, "limit": limit, "offset": offset})
+}
+
+func (s *Server) reviewAttendanceFraudAlert(w http.ResponseWriter, r *http.Request) {
+	claims := middleware.Claims(r)
+	id := chi.URLParam(r, "id")
+	var req struct {
+		Status string `json:"status"`
+		Note   string `json:"note"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Status = strings.ToLower(strings.TrimSpace(req.Status))
+	if req.Status != "reviewed" && req.Status != "false_positive" && req.Status != "confirmed" {
+		writeError(w, 400, "status must be reviewed, false_positive, or confirmed")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	defer tx.Rollback(ctx)
+	cmd, err := tx.Exec(ctx, `UPDATE attendance_events SET fraud_reviewed_by=$1,fraud_reviewed_at=now(),fraud_review_note=$2,fraud_status=$3 WHERE id=$4 AND org_id=$5 AND fraud_status <> 'normal'`, claims.UserID, nullIfEmpty(req.Note), req.Status, id, claims.OrgID)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	if cmd.RowsAffected() == 0 {
+		writeError(w, 404, "fraud alert not found")
+		return
+	}
+	_ = s.writeAudit(ctx, tx, claims.OrgID, claims.UserID, "attendance.fraud_review", "attendance_event", id, map[string]any{"status": req.Status, "note": req.Note})
+	if err := tx.Commit(ctx); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	s.invalidateOrgCaches(claims.OrgID)
+	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) createLeaveRequest(w http.ResponseWriter, r *http.Request) {
@@ -882,13 +1027,15 @@ func (s *Server) listCustomers(w http.ResponseWriter, r *http.Request) {
 	claims := middleware.Claims(r)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+	limit, offset := limitOffset(r, 100, 500)
 	args := []any{claims.OrgID}
 	q := `SELECT id,assigned_to,name,phone,address,lat,lng,active,created_at FROM customers WHERE org_id=$1`
 	if claims.Role == "sales" {
-		q += ` AND assigned_to=$2`
+		q += fmt.Sprintf(` AND assigned_to=$%d`, len(args)+1)
 		args = append(args, claims.UserID)
 	}
-	q += ` ORDER BY created_at DESC LIMIT 300`
+	q += fmt.Sprintf(` ORDER BY created_at DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
 	rows, err := s.db.Query(ctx, q, args...)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -908,7 +1055,7 @@ func (s *Server) listCustomers(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{"id": id, "assigned_to": assigned, "name": name, "phone": phone, "address": address, "lat": lat, "lng": lng, "active": active, "created_at": created})
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "customers": items})
+	writeJSON(w, 200, map[string]any{"ok": true, "customers": items, "limit": limit, "offset": offset})
 }
 
 func (s *Server) salesVisitCheckIn(w http.ResponseWriter, r *http.Request) {
@@ -953,6 +1100,7 @@ func (s *Server) salesVisitCheckIn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	s.invalidateOrgCaches(claims.OrgID)
 	writeJSON(w, 201, map[string]any{"ok": true, "id": id, "distance_m": distance})
 }
 
@@ -982,6 +1130,7 @@ func (s *Server) salesVisitCheckOut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "open sales visit not found")
 		return
 	}
+	s.invalidateOrgCaches(claims.OrgID)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -993,10 +1142,12 @@ func (s *Server) listSalesVisits(w http.ResponseWriter, r *http.Request) {
 	args := []any{claims.OrgID, from, to}
 	q := `SELECT v.id,v.user_id,u.full_name,v.customer_id,c.name,v.check_in_at,v.check_out_at,v.lat,v.lng,v.distance_m,v.notes FROM sales_visits v JOIN users u ON u.id=v.user_id JOIN customers c ON c.id=v.customer_id WHERE v.org_id=$1 AND v.check_in_at >= $2 AND v.check_in_at < $3`
 	if claims.Role == "sales" {
-		q += ` AND v.user_id=$4`
+		q += fmt.Sprintf(` AND v.user_id=$%d`, len(args)+1)
 		args = append(args, claims.UserID)
 	}
-	q += ` ORDER BY v.check_in_at DESC LIMIT 500`
+	limit, offset := limitOffset(r, 100, 500)
+	q += fmt.Sprintf(` ORDER BY v.check_in_at DESC LIMIT $%d OFFSET $%d`, len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
 	rows, err := s.db.Query(ctx, q, args...)
 	if err != nil {
 		writeError(w, 500, err.Error())
@@ -1017,7 +1168,7 @@ func (s *Server) listSalesVisits(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, map[string]any{"id": id, "user_id": uid, "full_name": uname, "customer_id": cid, "customer_name": cname, "check_in_at": in, "check_out_at": out, "lat": lat, "lng": lng, "distance_m": dist, "notes": notes})
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "visits": items})
+	writeJSON(w, 200, map[string]any{"ok": true, "visits": items, "limit": limit, "offset": offset})
 }
 
 func (s *Server) upsertKPI(w http.ResponseWriter, r *http.Request) {
@@ -1491,6 +1642,7 @@ func (s *Server) faceDeviceEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	s.invalidateOrgCaches(req.OrgID)
 	writeJSON(w, 201, map[string]any{"ok": true, "device_event_id": devID, "attendance_event_id": eventID})
 }
 
@@ -1499,15 +1651,32 @@ func (s *Server) reportSummary(w http.ResponseWriter, r *http.Request) {
 	period := strings.ToLower(valueOr(r.URL.Query().Get("period"), "daily"))
 	base := queryDate(r, "date", time.Now())
 	from, to := periodBounds(period, base)
+	cacheKey := fmt.Sprintf("report_summary:%s:%s:%s", claims.OrgID, period, from.Format("2006-01-02"))
+	var cached map[string]any
+	if s.cfg.CacheTTLSeconds > 0 && s.cache.GetJSON(cacheKey, &cached) {
+		cached["cache_hit"] = true
+		writeJSON(w, 200, cached)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	var employees, clockedIn, late, openSessions, visits int
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM users WHERE org_id=$1 AND active=true`, claims.OrgID).Scan(&employees)
-	_ = s.db.QueryRow(ctx, `SELECT count(DISTINCT user_id) FROM attendance_events WHERE org_id=$1 AND kind='in' AND event_at >= $2 AND event_at < $3`, claims.OrgID, from, to).Scan(&clockedIn)
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM attendance_sessions WHERE org_id=$1 AND late_minutes > 0 AND clock_in_at >= $2 AND clock_in_at < $3`, claims.OrgID, from, to).Scan(&late)
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM attendance_sessions WHERE org_id=$1 AND clock_out_at IS NULL`, claims.OrgID).Scan(&openSessions)
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM sales_visits WHERE org_id=$1 AND check_in_at >= $2 AND check_in_at < $3`, claims.OrgID, from, to).Scan(&visits)
-	writeJSON(w, 200, map[string]any{"ok": true, "period": period, "from": from, "to": to, "summary": map[string]any{"employees": employees, "clocked_in": clockedIn, "absent_estimate": maxInt(0, employees-clockedIn), "late_sessions": late, "open_sessions": openSessions, "sales_visits": visits}})
+	var employees, clockedIn, late, openSessions, visits, fraudWarnings int
+	err := s.db.QueryRow(ctx, `SELECT
+		(SELECT count(*)::int FROM users WHERE org_id=$1 AND active=true),
+		(SELECT count(DISTINCT user_id)::int FROM attendance_events WHERE org_id=$1 AND kind='in' AND event_at >= $2 AND event_at < $3),
+		(SELECT count(*)::int FROM attendance_sessions WHERE org_id=$1 AND late_minutes > 0 AND clock_in_at >= $2 AND clock_in_at < $3),
+		(SELECT count(*)::int FROM attendance_sessions WHERE org_id=$1 AND clock_out_at IS NULL),
+		(SELECT count(*)::int FROM sales_visits WHERE org_id=$1 AND check_in_at >= $2 AND check_in_at < $3),
+		(SELECT count(*)::int FROM attendance_events WHERE org_id=$1 AND fraud_status <> 'normal' AND event_at >= $2 AND event_at < $3)`, claims.OrgID, from, to).Scan(&employees, &clockedIn, &late, &openSessions, &visits, &fraudWarnings)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	payload := map[string]any{"ok": true, "period": period, "from": from, "to": to, "cache_hit": false, "summary": map[string]any{"employees": employees, "clocked_in": clockedIn, "absent_estimate": maxInt(0, employees-clockedIn), "late_sessions": late, "open_sessions": openSessions, "sales_visits": visits, "fraud_warnings": fraudWarnings}}
+	if s.cfg.CacheTTLSeconds > 0 {
+		s.cache.SetJSON(cacheKey, payload, time.Duration(s.cfg.CacheTTLSeconds)*time.Second)
+	}
+	writeJSON(w, 200, payload)
 }
 
 func (s *Server) reportInsights(w http.ResponseWriter, r *http.Request) {
@@ -1552,12 +1721,18 @@ func (s *Server) sendDailyTelegramReport(w http.ResponseWriter, r *http.Request)
 	from, to := periodBounds("daily", day)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	var employees, clockedIn, late, visits int
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM users WHERE org_id=$1 AND active=true`, claims.OrgID).Scan(&employees)
-	_ = s.db.QueryRow(ctx, `SELECT count(DISTINCT user_id) FROM attendance_events WHERE org_id=$1 AND kind='in' AND event_at >= $2 AND event_at < $3`, claims.OrgID, from, to).Scan(&clockedIn)
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM attendance_sessions WHERE org_id=$1 AND late_minutes > 0 AND clock_in_at >= $2 AND clock_in_at < $3`, claims.OrgID, from, to).Scan(&late)
-	_ = s.db.QueryRow(ctx, `SELECT count(*) FROM sales_visits WHERE org_id=$1 AND check_in_at >= $2 AND check_in_at < $3`, claims.OrgID, from, to).Scan(&visits)
-	text := fmt.Sprintf("📊 <b>CheckinMe Daily Report</b>\nDate: %s\nEmployees: %d\nClocked in: %d\nAbsent estimate: %d\nLate sessions: %d\nSales visits: %d", day.Format("2006-01-02"), employees, clockedIn, maxInt(0, employees-clockedIn), late, visits)
+	var employees, clockedIn, late, visits, fraudWarnings int
+	err := s.db.QueryRow(ctx, `SELECT
+		(SELECT count(*)::int FROM users WHERE org_id=$1 AND active=true),
+		(SELECT count(DISTINCT user_id)::int FROM attendance_events WHERE org_id=$1 AND kind='in' AND event_at >= $2 AND event_at < $3),
+		(SELECT count(*)::int FROM attendance_sessions WHERE org_id=$1 AND late_minutes > 0 AND clock_in_at >= $2 AND clock_in_at < $3),
+		(SELECT count(*)::int FROM sales_visits WHERE org_id=$1 AND check_in_at >= $2 AND check_in_at < $3),
+		(SELECT count(*)::int FROM attendance_events WHERE org_id=$1 AND fraud_status <> 'normal' AND event_at >= $2 AND event_at < $3)`, claims.OrgID, from, to).Scan(&employees, &clockedIn, &late, &visits, &fraudWarnings)
+	if err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	text := fmt.Sprintf("📊 <b>CheckinMe Daily Report</b>\nDate: %s\nEmployees: %d\nClocked in: %d\nAbsent estimate: %d\nLate sessions: %d\nFraud warnings: %d\nSales visits: %d", day.Format("2006-01-02"), employees, clockedIn, maxInt(0, employees-clockedIn), late, fraudWarnings, visits)
 	if err := s.telegram.SendMessage(ctx, s.orgTelegramChatID(ctx, claims.OrgID), text); err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -1871,6 +2046,89 @@ func (s *Server) verifyAttendanceEvidence(ctx context.Context, q queryer, orgID,
 		}
 	}
 	return source, branchID, qrTokenID, 0, ""
+}
+
+func (s *Server) assessAttendanceFraud(ctx context.Context, q queryer, orgID, userID, kind, source string, req attendanceClockRequest, branchID *string, qrTokenID *string, now time.Time) (attendanceFraudAssessment, error) {
+	result := attendanceFraudAssessment{Status: "normal", Reasons: []string{}}
+	add := func(score int, reason string) {
+		if score <= 0 || strings.TrimSpace(reason) == "" {
+			return
+		}
+		result.Score += score
+		result.Reasons = append(result.Reasons, reason)
+	}
+	if req.MockLocation != nil && *req.MockLocation {
+		add(100, "device reported mock/fake GPS location")
+	}
+	if req.GPSAccuracyM != nil && s.cfg.FraudMaxGPSAccuracyM > 0 && *req.GPSAccuracyM > s.cfg.FraudMaxGPSAccuracyM {
+		add(25, fmt.Sprintf("low GPS accuracy: %dm exceeds %dm", *req.GPSAccuracyM, s.cfg.FraudMaxGPSAccuracyM))
+	}
+	if (source == "gps" || source == "qr") && (req.Lat == nil || req.Lng == nil) {
+		add(45, "GPS/QR attendance missing location coordinates")
+	}
+	if source == "mobile" && req.Lat == nil && req.Lng == nil {
+		add(15, "mobile attendance has no GPS evidence")
+	}
+	if source == "face_scan" && req.FaceScore != nil && *req.FaceScore < 80 {
+		add(30, fmt.Sprintf("borderline face score %.2f", *req.FaceScore))
+	}
+	if qrTokenID != nil {
+		var replayCount int
+		seconds := s.cfg.FraudDuplicateSeconds
+		if seconds <= 0 {
+			seconds = 120
+		}
+		_ = q.QueryRow(ctx, `SELECT count(*)::int FROM attendance_events WHERE org_id=$1 AND user_id=$2 AND qr_token_id=$3 AND event_at >= $4`, orgID, userID, *qrTokenID, now.Add(-time.Duration(seconds)*time.Second)).Scan(&replayCount)
+		if replayCount > 0 {
+			add(35, fmt.Sprintf("QR token reused by same employee within %d seconds", seconds))
+		}
+	}
+	var duplicateCount int
+	seconds := s.cfg.FraudDuplicateSeconds
+	if seconds <= 0 {
+		seconds = 120
+	}
+	_ = q.QueryRow(ctx, `SELECT count(*)::int FROM attendance_events WHERE org_id=$1 AND user_id=$2 AND kind=$3 AND event_at >= $4`, orgID, userID, kind, now.Add(-time.Duration(seconds)*time.Second)).Scan(&duplicateCount)
+	if duplicateCount > 0 {
+		add(25, fmt.Sprintf("duplicate %s attendance event within %d seconds", kind, seconds))
+	}
+	if req.Lat != nil && req.Lng != nil {
+		var prevAt time.Time
+		var prevLat, prevLng float64
+		err := q.QueryRow(ctx, `SELECT event_at, lat::float8, lng::float8 FROM attendance_events WHERE org_id=$1 AND user_id=$2 AND lat IS NOT NULL AND lng IS NOT NULL ORDER BY event_at DESC LIMIT 1`, orgID, userID).Scan(&prevAt, &prevLat, &prevLng)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return result, err
+		}
+		if err == nil {
+			deltaSeconds := now.Sub(prevAt).Seconds()
+			if deltaSeconds > 30 {
+				distance := int(math.Round(haversineMeters(prevLat, prevLng, *req.Lat, *req.Lng)))
+				speed := (float64(distance) / 1000) / (deltaSeconds / 3600)
+				result.DistanceM = &distance
+				result.TravelSpeedKPH = &speed
+				if speed > s.cfg.FraudMaxSpeedKPH*2 {
+					add(100, fmt.Sprintf("impossible travel speed %.1f km/h", speed))
+				} else if speed > s.cfg.FraudMaxSpeedKPH {
+					add(60, fmt.Sprintf("suspicious travel speed %.1f km/h", speed))
+				}
+			}
+		}
+	}
+	if len(result.Reasons) == 0 {
+		result.Reasons = []string{"no fraud signal detected"}
+	}
+	if result.Score >= s.cfg.FraudBlockScore {
+		result.Status = "blocked"
+		result.Blocked = true
+		result.ReviewRequired = true
+	} else if result.Score >= s.cfg.FraudWarnScore {
+		result.Status = "needs_review"
+		result.ReviewRequired = true
+	} else if result.Score > 0 {
+		result.Status = "warning"
+		result.ReviewRequired = result.Score >= s.cfg.FraudWarnScore/2
+	}
+	return result, nil
 }
 
 func validateBranchGeofence(ctx context.Context, q queryer, orgID, branchID string, lat, lng float64, radiusOverride *int) (bool, string) {
@@ -2329,6 +2587,103 @@ func (s *Server) reviewEWARequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (s *Server) requestTimeoutMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seconds := s.cfg.RequestTimeoutSeconds
+		if seconds <= 0 {
+			seconds = 15
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(seconds)*time.Second)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *Server) requestLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		dur := time.Since(start)
+		threshold := time.Duration(s.cfg.SlowRequestMS) * time.Millisecond
+		if s.cfg.SlowRequestMS <= 0 {
+			threshold = 700 * time.Millisecond
+		}
+		if dur >= threshold || rec.status >= 500 {
+			log.Printf("http request method=%s path=%s status=%d duration_ms=%d", r.Method, r.URL.Path, rec.status, dur.Milliseconds())
+		}
+	})
+}
+
+func (s *Server) runAsync(fn func()) {
+	select {
+	case s.asyncSem <- struct{}{}:
+		go func() {
+			defer func() { <-s.asyncSem }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("async job panic recovered: %v", rec)
+				}
+			}()
+			fn()
+		}()
+	default:
+		log.Printf("async worker saturated; background job skipped")
+	}
+}
+
+func (s *Server) invalidateOrgCaches(orgID string) {
+	s.cache.DeletePrefix("report_summary:" + orgID + ":")
+	s.cache.DeletePrefix("sales_summary:" + orgID + ":")
+	// Keep org_telegram cache because it is stable and harmless if stale for a short TTL.
+}
+
+func (s *Server) writeAudit(ctx context.Context, q queryer, orgID, actorID, action, entity, entityID string, meta any) error {
+	buf, err := json.Marshal(meta)
+	if err != nil {
+		buf = []byte(`{}`)
+	}
+	_, err = q.Exec(ctx, `INSERT INTO audit_logs(org_id,actor_id,action,entity,entity_id,meta) VALUES($1,$2,$3,$4,$5,$6::jsonb)`, orgID, actorID, action, nullIfEmpty(entity), nullIfEmpty(entityID), string(buf))
+	return err
+}
+
+func (s *Server) systemPerformance(w http.ResponseWriter, r *http.Request) {
+	stat := s.db.Stat()
+	writeJSON(w, 200, map[string]any{
+		"ok": true,
+		"cache": map[string]any{
+			"type":        "memory_ttl",
+			"items":       s.cache.Size(),
+			"ttl_seconds": s.cfg.CacheTTLSeconds,
+		},
+		"async": map[string]any{
+			"limit":  cap(s.asyncSem),
+			"in_use": len(s.asyncSem),
+		},
+		"postgres_pool": map[string]any{
+			"acquire_count":          stat.AcquireCount(),
+			"acquire_duration_ms":    stat.AcquireDuration().Milliseconds(),
+			"acquired_conns":         stat.AcquiredConns(),
+			"canceled_acquire_count": stat.CanceledAcquireCount(),
+			"constructing_conns":     stat.ConstructingConns(),
+			"empty_acquire_count":    stat.EmptyAcquireCount(),
+			"idle_conns":             stat.IdleConns(),
+			"max_conns":              stat.MaxConns(),
+			"total_conns":            stat.TotalConns(),
+		},
+	})
 }
 
 // ---------- helpers ----------

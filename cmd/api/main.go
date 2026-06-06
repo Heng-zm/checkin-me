@@ -21,11 +21,18 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 	ctx := context.Background()
-	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnIdleMinutes)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnIdleMinutes, cfg.DBQueryExecMode)
 	if err != nil {
 		log.Fatalf("database error: %v", err)
 	}
 	defer pool.Close()
+
+	if cfg.AutoMigrate {
+		if err := db.Migrate(ctx, pool); err != nil {
+			log.Fatalf("migration error: %v", err)
+		}
+		log.Printf("database migrations applied")
+	}
 
 	telegram := services.NewTelegramClient(cfg.TelegramBotToken, cfg.TelegramDefaultChatID)
 	srv := httpapi.NewServer(cfg, pool, telegram)
