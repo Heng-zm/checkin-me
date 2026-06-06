@@ -1,5 +1,12 @@
 # Changelog
 
+## v5.2 - Supabase schema isolation fix
+- Added `DB_SCHEMA=checkinme` support.
+- App connections now set `search_path` to the configured schema.
+- Startup creates the schema automatically before migrations.
+- Fixes Supabase projects that already have `public.users` or other existing app tables.
+
+
 ## v4 - Attendance Anti-Fraud V2 + Performance V2
 
 ### Added
@@ -43,3 +50,8 @@
 - Added `docs/SUPABASE_DEPLOY.md`.
 - Added `DB_QUERY_EXEC_MODE` for Supabase transaction-pooler compatibility.
 - Reduced default DB pool size for Supabase-friendly deployment.
+
+## v5.1 Render build checksum fix
+
+- Updated Dockerfile to build with `go build -mod=mod` so Render can resolve missing `go.sum` entries during Docker builds.
+- Added `docs/RENDER_BUILD_FIX.md`.

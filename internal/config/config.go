@@ -26,6 +26,7 @@ type Config struct {
 	DBMinConns            int32
 	DBMaxConnIdleMinutes  int
 	DBQueryExecMode       string
+	DBSchema              string
 	RequestTimeoutSeconds int
 	SlowRequestMS         int
 	CacheTTLSeconds       int
@@ -57,6 +58,7 @@ func Load() Config {
 		DBMinConns:            int32(envInt("DB_MIN_CONNS", 2)),
 		DBMaxConnIdleMinutes:  envInt("DB_MAX_CONN_IDLE_MINUTES", 10),
 		DBQueryExecMode:       env("DB_QUERY_EXEC_MODE", "auto"),
+		DBSchema:              env("DB_SCHEMA", "checkinme"),
 		RequestTimeoutSeconds: envInt("REQUEST_TIMEOUT_SECONDS", 15),
 		SlowRequestMS:         envInt("SLOW_REQUEST_MS", 700),
 		CacheTTLSeconds:       envInt("CACHE_TTL_SECONDS", 60),
@@ -107,6 +109,9 @@ func (c Config) Validate() error {
 	if c.DBQueryExecMode != "auto" && c.DBQueryExecMode != "simple_protocol" {
 		return fmt.Errorf("DB_QUERY_EXEC_MODE must be auto or simple_protocol")
 	}
+	if !validDBSchema(c.DBSchema) {
+		return fmt.Errorf("DB_SCHEMA must be a safe PostgreSQL identifier")
+	}
 	if c.RequestTimeoutSeconds < 1 {
 		return fmt.Errorf("REQUEST_TIMEOUT_SECONDS must be greater than 0")
 	}
@@ -123,6 +128,25 @@ func (c Config) Validate() error {
 		return fmt.Errorf("FRAUD_MAX_SPEED_KPH must be greater than 0")
 	}
 	return nil
+}
+
+func validDBSchema(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	for i, r := range v {
+		if i == 0 {
+			if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+				return false
+			}
+			continue
+		}
+		if !(r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
 }
 
 func envInt(key string, fallback int) int {

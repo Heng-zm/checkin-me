@@ -21,11 +21,15 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 	ctx := context.Background()
-	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnIdleMinutes, cfg.DBQueryExecMode)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.DBMaxConns, cfg.DBMinConns, cfg.DBMaxConnIdleMinutes, cfg.DBQueryExecMode, cfg.DBSchema)
 	if err != nil {
 		log.Fatalf("database error: %v", err)
 	}
 	defer pool.Close()
+
+	if err := db.EnsureSchema(ctx, pool, cfg.DBSchema); err != nil {
+		log.Fatalf("database schema error: %v", err)
+	}
 
 	if cfg.AutoMigrate {
 		if err := db.Migrate(ctx, pool); err != nil {

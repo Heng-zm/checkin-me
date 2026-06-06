@@ -337,3 +337,8 @@ FRAUD_DUPLICATE_SECONDS=120
 ```
 
 See `docs/ANTI_FRAUD_V2.md` and `docs/PERFORMANCE_V2.md` for details.
+
+
+## Existing Supabase tables
+
+If your Supabase `public` schema already contains tables like `users`, `hosted_sites`, or bot tables, keep `DB_SCHEMA=checkinme`. The API will create and use the separate `checkinme` schema, so the migration will not conflict with your existing public tables.

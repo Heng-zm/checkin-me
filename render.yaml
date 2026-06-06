@@ -44,6 +44,8 @@ services:
         value: 5
       - key: DB_QUERY_EXEC_MODE
         value: auto
+      - key: DB_SCHEMA
+        value: checkinme
       - key: REQUEST_TIMEOUT_SECONDS
         value: 15
       - key: SLOW_REQUEST_MS

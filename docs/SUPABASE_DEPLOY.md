@@ -15,6 +15,7 @@ Recommended connection for Render:
 ```env
 DATABASE_URL=postgresql://postgres.PROJECT_REF:YOUR_DB_PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
 DB_QUERY_EXEC_MODE=auto
+DB_SCHEMA=checkinme
 ```
 
 Why Session pooler? Supabase direct connections are IPv6 by default unless you enable the IPv4 add-on. The Supavisor pooler is the safer choice for platforms that may not support direct IPv6 database connections.
@@ -61,6 +62,7 @@ DB_MAX_CONNS=8
 DB_MIN_CONNS=1
 DB_MAX_CONN_IDLE_MINUTES=5
 DB_QUERY_EXEC_MODE=auto
+DB_SCHEMA=checkinme
 ```
 
 ## 5. First production test
@@ -102,3 +104,8 @@ You should see CheckinMe tables such as `organizations`, `users`, `attendance_ev
 - Keep `AUTO_MIGRATE=true` for first deploy, then you may set it to `false` after migrations are applied.
 - Do not paste Supabase service role keys into this API unless you later add Supabase Storage/Auth features.
 - Do not expose database credentials in frontend apps.
+
+
+## Existing Supabase tables
+
+If your Supabase `public` schema already contains tables like `users`, `hosted_sites`, or bot tables, keep `DB_SCHEMA=checkinme`. The API will create and use the separate `checkinme` schema, so the migration will not conflict with your existing public tables.

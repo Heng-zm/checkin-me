@@ -14,6 +14,7 @@ Recommended:
 ```env
 DATABASE_URL=postgresql://postgres.PROJECT_REF:YOUR_DB_PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require
 DB_QUERY_EXEC_MODE=auto
+DB_SCHEMA=checkinme
 ```
 
 If you use Transaction pooler on port `6543`, set:
@@ -106,3 +107,8 @@ curl -X POST https://YOUR_RENDER_URL.onrender.com/api/v1/auth/login \
 - Do not store bank credentials in code.
 - Do not expose `DATABASE_URL` in frontend apps.
 - Review logs after first deploy. If health check fails, check `DATABASE_URL`, SSL mode, and Supabase pooler mode.
+
+
+## Existing Supabase tables
+
+If your Supabase `public` schema already contains tables like `users`, `hosted_sites`, or bot tables, keep `DB_SCHEMA=checkinme`. The API will create and use the separate `checkinme` schema, so the migration will not conflict with your existing public tables.
